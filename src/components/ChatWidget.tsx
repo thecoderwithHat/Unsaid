@@ -1,11 +1,15 @@
 "use client";
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import Pusher, { Channel, ChannelAuthorizerGenerator, ChannelAuthorizationCallback } from 'pusher-js';
 import { useSession } from 'next-auth/react';
 import { usePathname } from 'next/navigation';
 
-const EVENT = 'message';
+type ChatMessage = {
+  text: string;
+  ts: number;
+  sender?: string;
+  senderId?: string;
+};
 
 const ChatWidget: React.FC = () => {
   const { data: session } = useSession();
@@ -13,101 +17,64 @@ const ChatWidget: React.FC = () => {
   const pathname = usePathname();
 
   const [open, setOpen] = useState(false);
-  const [messages, setMessages] = useState<{ text: string; ts: number; sender?: string }[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
-  const [channelName, setChannelName] = useState('public-chat');
+  const [channelName, setChannelName] = useState('');
   const [isSubscribed, setIsSubscribed] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
   const [assignedCounsellor, setAssignedCounsellor] = useState<{ id: string; name?: string; email?: string } | null>(null);
-  const pusherRef = useRef<Pusher | null>(null);
-  const channelRef = useRef<Channel | null>(null);
+
+  const wsRef = useRef<WebSocket | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
 
-  const subscribeToChannel = useCallback(async (name: string, idToken?: string) => {
-    console.log('[ChatWidget] ===== SUBSCRIBING TO CHANNEL =====');
-    console.log('[ChatWidget] Channel name:', name);
-    console.log('[ChatWidget] User:', user?.email, 'Role:', user?.role, 'ID:', user?.id);
-    console.log('[ChatWidget] ====================================');
-    
-    // cleanup existing
-    if (pusherRef.current) {
+  const connectToRoom = useCallback((name: string) => {
+    if (!name || typeof window === 'undefined') return;
+
+    if (wsRef.current) {
       try {
-        pusherRef.current.disconnect();
-      } catch {}
-      pusherRef.current = null;
-      channelRef.current = null;
+        wsRef.current.close();
+      } catch {
+        // no-op
+      }
+      wsRef.current = null;
     }
 
-    console.debug('[ChatWidget] creating pusher with key', process.env.NEXT_PUBLIC_PUSHER_KEY);
-    pusherRef.current = new Pusher(process.env.NEXT_PUBLIC_PUSHER_KEY || '', {
-      cluster: process.env.NEXT_PUBLIC_PUSHER_CLUSTER || '',
-      authEndpoint: '/api/pusher/auth',
-      auth: { ...(idToken ? { headers: { Authorization: `Bearer ${idToken}` } } : {}) },
-      authorizer: (channel): ReturnType<ChannelAuthorizerGenerator> => {
-        return {
-          authorize: (socketId: string, callback: ChannelAuthorizationCallback) => {
-            (async () => {
-              try {
-                console.debug('[ChatWidget] authorizer: requesting auth for channel', channel.name, 'socket', socketId);
-                const res = await fetch('/api/pusher/auth', {
-                  method: 'POST',
-                  credentials: 'include',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ socket_id: socketId, channel_name: channel.name }),
-                });
-                const data = await res.json();
-                console.debug('[ChatWidget] authorizer response', res.status, data);
-                if (res.ok) callback(null, data);
-                else callback(new Error('Auth error'), null);
-              } catch (err) {
-                console.error('[ChatWidget] authorizer error', err);
-                callback(err as Error, null);
-              }
-            })();
-          },
-        };
-      },
-    });
-
-    pusherRef.current.connection.bind('connected', () => console.debug('[ChatWidget] pusher connected'));
-    pusherRef.current.connection.bind('error', (err: unknown) => console.error('[ChatWidget] pusher connection error', err));
-
-    const channel = pusherRef.current.subscribe(name);
-    channel.bind('pusher:subscription_succeeded', () => {
-      console.debug('[ChatWidget] subscription succeeded', name);
-      setIsSubscribed(true);
-    });
-    channel.bind('pusher:subscription_error', (err: unknown) => {
-      console.error('[ChatWidget] subscription error', name, err);
-      setIsSubscribed(false);
-    });
-
-    channel.bind(EVENT, (data: { message?: string; timestamp?: number; sender?: string }) => {
-      if (data && typeof data.message === 'string') {
-        const text = data.message;
-        const ts = data.timestamp || Date.now();
-        console.debug('[ChatWidget] incoming message from Pusher', { text, ts, sender: data.sender });
-        
-        // Add message, but check for duplicates (within 1 second window)
-        setMessages((m) => {
-          const isDuplicate = m.some(msg => 
-            msg.text === text && 
-            msg.sender === data.sender && 
-            Math.abs(msg.ts - ts) < 1000
-          );
-          
-          if (isDuplicate) {
-            console.debug('[ChatWidget] Duplicate message detected, skipping');
-            return m;
-          }
-          
-          return [...m, { text, ts, sender: data.sender }];
-        });
-      }
-    });
-
-    channelRef.current = channel;
+    setMessages([]);
+    setIsSubscribed(false);
+    setConnectionError(null);
     setChannelName(name);
-  }, [user]);
+
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const ws = new WebSocket(`${protocol}://${window.location.host}/api/socket?room=${encodeURIComponent(name)}`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setIsSubscribed(true);
+    };
+
+    ws.onerror = () => {
+      setConnectionError('Unable to connect to chat. Please try again.');
+      setIsSubscribed(false);
+    };
+
+    ws.onclose = (evt) => {
+      setIsSubscribed(false);
+      if (evt.code === 1008 && evt.reason) {
+        setConnectionError(evt.reason);
+      }
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data as string) as Partial<ChatMessage>;
+        if (typeof data.text !== 'string') return;
+        const ts = typeof data.ts === 'number' ? data.ts : Date.now();
+        setMessages((prev) => [...prev, { text: data.text!, ts, sender: data.sender, senderId: data.senderId }]);
+      } catch {
+        // ignore malformed messages
+      }
+    };
+  }, []);
 
   // Fetch assigned counsellor on mount (for patients)
   useEffect(() => {
@@ -120,11 +87,10 @@ const ChatWidget: React.FC = () => {
           const data = await res.json();
           if (data.assignment?.counsellor) {
             setAssignedCounsellor(data.assignment.counsellor);
-            console.debug('[ChatWidget] Assigned counsellor:', data.assignment.counsellor);
           }
         }
-      } catch (err) {
-        console.error('[ChatWidget] Failed to fetch assignment:', err);
+      } catch {
+        // ignore assignment failures
       }
     };
 
@@ -138,151 +104,118 @@ const ChatWidget: React.FC = () => {
     const updateActivity = async () => {
       try {
         const res = await fetch('/api/activity', { method: 'POST' });
-        if (res.ok) {
-          console.debug('[ChatWidget] Activity heartbeat sent successfully');
-        } else {
-          console.warn('[ChatWidget] Activity heartbeat failed:', res.status);
+        if (!res.ok) {
+          // no-op
         }
-      } catch (err) {
-        console.debug('[ChatWidget] Activity update failed:', err);
+      } catch {
+        // ignore heartbeat failures
       }
     };
 
-    // Initial update
     updateActivity();
 
-    // Update every 30 seconds (more frequent for better real-time feel)
     const interval = setInterval(updateActivity, 30 * 1000);
-
     return () => clearInterval(interval);
   }, [session, user]);
 
   useEffect(() => {
     if (session && user && open && !isSubscribed) {
-      console.debug('[ChatWidget] auto-subscribing to channel');
-      
-      // If patient with assigned counsellor, use private channel
       if (user.role === 'USER' && assignedCounsellor) {
         const privateChannel = `private-chat-${assignedCounsellor.id}-${user.id}`;
-        console.debug('[ChatWidget] Using private channel with assigned counsellor:', privateChannel);
-        subscribeToChannel(privateChannel);
-      } else if (user.role === 'COUNSELLOR') {
-        // Counsellor should not auto-subscribe to public-chat
-        // They will only join private channels via the open-chat event
-        console.debug('[ChatWidget] Counsellor waiting for specific patient chat');
-      } else {
-        // Otherwise use public chat
-        subscribeToChannel('public-chat');
+        connectToRoom(privateChannel);
       }
     }
-  }, [session, user, open, isSubscribed, assignedCounsellor, subscribeToChannel]);
+  }, [session, user, open, isSubscribed, assignedCounsellor, connectToRoom]);
 
   // Listen for a global event to open the chat (used by counsellor/patient dashboards)
   useEffect(() => {
     if (!session || !user) return;
 
     const handler = async (ev: Event) => {
-      console.log('[ChatWidget] ===== OPEN-CHAT EVENT RECEIVED =====');
       setOpen(true);
       const anyEv = ev as CustomEvent<Record<string, string | undefined>>;
       const counsellorId = anyEv?.detail?.counsellorId;
       const patientId = anyEv?.detail?.patientId;
-      
-      console.log('[ChatWidget] Event details:', { counsellorId, patientId, userRole: user.role, userId: user.id });
 
       try {
-        // If counsellor opening chat with patient
         if (user.role === 'COUNSELLOR' && patientId) {
           const name = `private-chat-${user.id}-${patientId}`;
-          console.log('[ChatWidget] ✅ Counsellor opening chat with patient, channel:', name);
-          await subscribeToChannel(name);
+          connectToRoom(name);
           return;
         }
 
-        // If patient opening chat with counsellor (or assigned counsellor)
         if (counsellorId) {
           const patientUid = user?.id;
           if (patientUid) {
             const name = `private-chat-${counsellorId}-${patientUid}`;
-            console.debug('[ChatWidget] Patient opening chat with counsellor:', name);
-            await subscribeToChannel(name);
+            connectToRoom(name);
             return;
           }
         }
 
-        // Patient with assigned counsellor opening chat (no explicit counsellor ID in event)
         if (user.role === 'USER' && assignedCounsellor) {
           const name = `private-chat-${assignedCounsellor.id}-${user.id}`;
-          console.log('[ChatWidget] Patient opening chat with assigned counsellor:', name);
-          await subscribeToChannel(name);
+          connectToRoom(name);
           return;
         }
-
-        // Fallback to public chat only if no private channel is applicable
-        console.log('[ChatWidget] Falling back to public-chat');
-        await subscribeToChannel('public-chat');
-      } catch (err) {
-        console.error('subscribe error', err);
+      } catch {
+        // ignore
       }
     };
 
     window.addEventListener('open-chat', handler as EventListener);
     return () => window.removeEventListener('open-chat', handler as EventListener);
-  }, [user, session, assignedCounsellor, subscribeToChannel]);
+  }, [user, session, assignedCounsellor, connectToRoom]);
 
   useEffect(() => {
     messagesRef.current?.scrollTo({ top: messagesRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages]);
 
+  useEffect(() => {
+    return () => {
+      if (wsRef.current) {
+        try {
+          wsRef.current.close();
+        } catch {
+          // no-op
+        }
+      }
+    };
+  }, []);
+
   const sendMessage = async () => {
     if (!input.trim()) return;
     const sender = user?.email ?? user?.id ?? 'Guest';
+    const senderId = user?.id;
     const messageText = input;
     const timestamp = Date.now();
-    
-    // Optimistic update - show message immediately
-    setMessages((m) => [...m, { text: messageText, ts: timestamp, sender }]);
+
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setConnectionError('Chat is not connected.');
+      return;
+    }
+
+    setMessages((m) => [...m, { text: messageText, ts: timestamp, sender, senderId }]);
     setInput('');
-    
-    const payload = { channel: channelName, event: EVENT, message: messageText, sender };
-    console.log('[ChatWidget] ===== SENDING MESSAGE =====');
-    console.log('[ChatWidget] Channel:', channelName);
-    console.log('[ChatWidget] Sender:', sender);
-    console.log('[ChatWidget] Message:', messageText);
-    console.log('[ChatWidget] ============================');
-    
+
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const result = await response.json();
-      console.debug('[ChatWidget] send response', response.status, result);
-      
-      if (!response.ok) {
-        console.error('[ChatWidget] Failed to send message:', result);
-        // Remove optimistic message on failure
-        setMessages((m) => m.filter(msg => !(msg.text === messageText && msg.ts === timestamp)));
-      }
-    } catch (err) {
-      console.error('sendMessage error', err);
-      // Remove optimistic message on error
-      setMessages((m) => m.filter(msg => !(msg.text === messageText && msg.ts === timestamp)));
+      ws.send(JSON.stringify({ text: messageText }));
+    } catch {
+      setConnectionError('Failed to send message.');
+      setMessages((m) => m.filter((msg) => !(msg.text === messageText && msg.ts === timestamp)));
     }
   };
 
-  const isOwnMessage = (sender?: string) => {
-    if (!sender) return false;
-    return sender === user?.email || sender === user?.id;
+  const isOwnMessage = (sender?: string, senderId?: string) => {
+    if (!sender && !senderId) return false;
+    return senderId === user?.id || sender === user?.email || sender === user?.id;
   };
 
-  // Don't render widget if user is not authenticated
   if (!session || !user) {
     return null;
   }
 
-  // Don't show chat button for counsellors on /connect page
   const shouldHideButton = user.role === 'COUNSELLOR' && pathname === '/connect';
 
   return (
@@ -335,6 +268,9 @@ const ChatWidget: React.FC = () => {
               {user.role === 'COUNSELLOR' && channelName.startsWith('private-') && (
                 <div className="text-sm text-gray-600">Private conversation</div>
               )}
+              {connectionError && (
+                <div className="text-xs text-red-500">{connectionError}</div>
+              )}
             </div>
             <button
               onClick={() => setOpen(false)}
@@ -347,10 +283,10 @@ const ChatWidget: React.FC = () => {
           {/* Messages */}
           <div ref={messagesRef} className="flex-1 overflow-y-auto px-4 py-2 space-y-4 custom-scrollbar">
             {messages.map((m, i) => (
-              <div key={i} className={`flex ${isOwnMessage(m.sender) ? "justify-end" : "justify-start"}`}>
+              <div key={i} className={`flex ${isOwnMessage(m.sender, m.senderId) ? "justify-end" : "justify-start"}`}>
                 <div
                   className={`max-w-[60%] px-6 py-3 rounded-xl ${
-                    isOwnMessage(m.sender)
+                    isOwnMessage(m.sender, m.senderId)
                       ? "bg-[#A1CDD9] text-white text-xl font-unsaid font-bold border border-[#F4A258]"
                       : "bg-white text-[#736B66] text-xl font-unsaid font-bold border border-[#F4A258]"
                   }`}
@@ -359,6 +295,9 @@ const ChatWidget: React.FC = () => {
                 </div>
               </div>
             ))}
+            {!channelName && (
+              <div className="text-sm text-gray-500 text-center">Start a conversation with your assigned counsellor.</div>
+            )}
           </div>
 
           {/* Input */}
@@ -375,6 +314,7 @@ const ChatWidget: React.FC = () => {
             <button
               onClick={sendMessage}
               className="bg-[#F4A258] hover:bg-[#DC924F] text-xl text-white font-extrabold px-8 py-2 rounded-3xl cursor-pointer shadow-md transform active:shadow-none active:scale-95 transition-all duration-75 ease-out"
+              disabled={!isSubscribed}
             >
               Send
             </button>
